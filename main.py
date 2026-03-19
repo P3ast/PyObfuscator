@@ -8,10 +8,11 @@ l'insertion de code mort, et un menu interactif.
 
 import argparse
 import ast
+import builtins
+import copy
 import os
 import sys
 import random
-import string
 
 
 BANNER = r"""
@@ -48,51 +49,22 @@ def c(text, color):
     return f"{COLORS.get(color, '')}{text}{COLORS['RESET']}"
 
 
-#  NOMS PROTÉGÉS
+#  NOMS PROTÉGÉS (auto-générés depuis le module builtins + noms spéciaux)
 
-BUILTIN_NAMES = {
-    # Fonctions built-in
-    'print', 'range', 'len', 'int', 'str', 'list', 'dict', 'tuple', 'set',
-    'float', 'bool', 'bytes', 'bytearray', 'memoryview', 'object', 'type',
-    'enumerate', 'map', 'filter', 'zip', 'sum', 'min', 'max', 'abs',
-    'any', 'all', 'sorted', 'reversed', 'open', 'input', 'eval', 'exec',
-    'compile', 'repr', 'vars', 'dir', 'help', 'id', 'hash', 'hex', 'oct',
-    'bin', 'ord', 'chr', 'ascii', 'format', 'round', 'pow', 'divmod',
-    'isinstance', 'issubclass', 'callable', 'hasattr', 'getattr', 'setattr',
-    'delattr', 'super', 'property', 'classmethod', 'staticmethod',
-    'breakpoint', 'globals', 'locals', 'next', 'iter', 'slice',
-    'complex', 'frozenset',
-
-    # Exceptions courantes
-    'Exception', 'BaseException', 'ValueError', 'TypeError', 'KeyError',
-    'IndexError', 'AttributeError', 'ImportError', 'ModuleNotFoundError',
-    'FileNotFoundError', 'IOError', 'OSError', 'RuntimeError',
-    'StopIteration', 'GeneratorExit', 'SystemExit', 'KeyboardInterrupt',
-    'ArithmeticError', 'ZeroDivisionError', 'OverflowError',
-    'FloatingPointError', 'LookupError', 'NameError', 'UnboundLocalError',
-    'SyntaxError', 'IndentationError', 'TabError', 'SystemError',
-    'UnicodeError', 'UnicodeDecodeError', 'UnicodeEncodeError',
-    'UnicodeTranslateError', 'Warning', 'UserWarning', 'DeprecationWarning',
-    'PendingDeprecationWarning', 'RuntimeWarning', 'SyntaxWarning',
-    'ResourceWarning', 'FutureWarning', 'ImportWarning', 'BytesWarning',
-    'NotImplementedError', 'RecursionError', 'PermissionError',
-    'ProcessLookupError', 'TimeoutError', 'ConnectionError',
-    'BrokenPipeError', 'ConnectionAbortedError', 'ConnectionRefusedError',
-    'ConnectionResetError', 'FileExistsError', 'InterruptedError',
-    'IsADirectoryError', 'NotADirectoryError', 'ChildProcessError',
-    'BlockingIOError', 'BufferError', 'EOFError', 'AssertionError',
-    'StopAsyncIteration',
-
-    # Constantes
+BUILTIN_NAMES = set(dir(builtins)) | {
+    'self', 'cls', '__all__', '__slots__',
     'None', 'True', 'False', 'NotImplemented', 'Ellipsis',
-    '__all__', '__slots__',
-
-    # Noms spéciaux
-    'self', 'cls',
 }
 
 # Noms qui commencent par __ (dunder) sont toujours protégés
 # Les noms importés sont collectés dynamiquement
+
+# Définition centralisée des options d'obfuscation
+OBFUSCATION_OPTIONS = [
+    ('rename_vars',     'Renommage de variables (AST)',                  True),
+    ('strip_docstrings','Suppression des commentaires & docstrings',     False),
+    ('dead_code',       'Insertion de code mort (Dead Code)',            False),
+]
 
 #  COLLECTEUR DE NOMS PROTÉGÉS (phase 1 : analyse)
 
@@ -306,94 +278,74 @@ class DeadCodeInserter(ast.NodeTransformer):
 
 #  FONCTIONS D'OBFUSCATION
 
+def _apply_transform(source_code, transformer, label):
+    """Applique un ast.NodeTransformer générique sur le code source."""
+    try:
+        tree = ast.parse(source_code)
+        tree = transformer.visit(tree)
+        ast.fix_missing_locations(tree)
+        return ast.unparse(tree)
+    except Exception as e:
+        print(f"  {c('[-]', 'RED')} Erreur {label} : {e}")
+        return source_code
+
+
 def apply_variable_renaming(source_code):
     """Renomme les variables locales de manière sûre."""
     try:
         tree = ast.parse(source_code)
-
         # Phase 1 : collecter les noms protégés
         collector = ProtectedNameCollector()
         collector.visit(tree)
-
-        # Phase 2 : renommer les variables non protégées
-        tree = ast.parse(source_code)  # Re-parser pour un arbre propre
+        # Phase 2 : renommer sur une copie de l'arbre (évite un double parse)
+        tree_copy = copy.deepcopy(tree)
         renamer = SafeVariableRenamer(collector.protected)
-        tree = renamer.visit(tree)
-        ast.fix_missing_locations(tree)
-
-        result = ast.unparse(tree)
-        return result
+        tree_copy = renamer.visit(tree_copy)
+        ast.fix_missing_locations(tree_copy)
+        return ast.unparse(tree_copy)
     except Exception as e:
         print(f"  {c('[-]', 'RED')} Erreur renommage variables : {e}")
         return source_code
 
 
-def apply_docstring_removal(source_code):
-    """Supprime les docstrings du code."""
-    try:
-        tree = ast.parse(source_code)
-        remover = DocstringRemover()
-        tree = remover.visit(tree)
-        ast.fix_missing_locations(tree)
-        return ast.unparse(tree)
-    except Exception as e:
-        print(f"  {c('[-]', 'RED')} Erreur suppression docstrings : {e}")
-        return source_code
-
-
-def apply_dead_code_insertion(source_code):
-    """Insère du code mort pour compliquer la lecture."""
-    try:
-        tree = ast.parse(source_code)
-        inserter = DeadCodeInserter()
-        tree = inserter.visit(tree)
-        ast.fix_missing_locations(tree)
-        return ast.unparse(tree)
-    except Exception as e:
-        print(f"  {c('[-]', 'RED')} Erreur insertion code mort : {e}")
-        return source_code
-
-
-def fix_string_quotes(code):
-    """Post-traitement : s'assure que les chaînes avec apostrophes
-    sont correctement gérées. ast.unparse() gère déjà l'échappement,
-    mais on vérifie la syntaxe finale."""
-    try:
-        # Vérifier que le résultat est du Python valide
-        ast.parse(code)
-        return code
-    except SyntaxError:
-        # En cas de problème, on tente de re-parser et re-unparse
-        # ce qui force ast à corriger les quotes
-        try:
-            tree = ast.parse(code)
-            return ast.unparse(tree)
-        except Exception:
-            return code
-
-
 def obfuscate_content(content, options):
     """Applique les transformations d'obfuscation selon les options."""
+    # Pipeline : chaque étape prend le résultat de la précédente
+    pipeline = [
+        ('rename_vars',     'Renommage des variables',     lambda src: apply_variable_renaming(src)),
+        ('strip_docstrings','Suppression des docstrings',   lambda src: _apply_transform(src, DocstringRemover(), 'suppression docstrings')),
+        ('dead_code',       'Insertion de code mort',       lambda src: _apply_transform(src, DeadCodeInserter(), 'insertion code mort')),
+    ]
+
     result = content
-
-    if options.get('rename_vars', False):
-        print(f"  {c('[*]', 'CYAN')} Renommage des variables...")
-        result = apply_variable_renaming(result)
-
-    if options.get('strip_docstrings', False):
-        print(f"  {c('[*]', 'CYAN')} Suppression des docstrings...")
-        result = apply_docstring_removal(result)
-
-    if options.get('dead_code', False):
-        print(f"  {c('[*]', 'CYAN')} Insertion de code mort...")
-        result = apply_dead_code_insertion(result)
-
-    # Post-traitement des strings
-    result = fix_string_quotes(result)
+    for key, label, transform in pipeline:
+        if options.get(key, False):
+            print(f"  {c('[*]', 'CYAN')} {label}...")
+            result = transform(result)
 
     return result
 
 #  TRAITEMENT DE FICHIERS
+
+def _read_file(filepath):
+    """Lit un fichier Python avec fallback d'encodage."""
+    for encoding in ('utf-8', 'latin-1'):
+        try:
+            with open(filepath, 'r', encoding=encoding) as f:
+                return f.read()
+        except UnicodeDecodeError:
+            continue
+    return None
+
+
+def _write_file(filepath, content):
+    """Écrit du contenu dans un fichier en créant les dossiers parents."""
+    output_dir = os.path.dirname(filepath)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+    with open(filepath, 'w', encoding='utf-8') as f:
+        f.write(content)
+
 
 def process_file(input_file, output_file, options, stats=None):
     """Traite un fichier Python unique."""
@@ -405,26 +357,15 @@ def process_file(input_file, output_file, options, stats=None):
             print(f"  {c('[!]', 'YELLOW')} Ignoré : {input_file} (pas un fichier .py)")
             return stats
 
-        try:
-            with open(input_file, 'r', encoding='utf-8') as f:
-                content = f.read()
-        except UnicodeDecodeError:
-            try:
-                with open(input_file, 'r', encoding='latin-1') as f:
-                    content = f.read()
-            except Exception:
-                print(f"  {c('[-]', 'RED')} Erreur d'encodage : {input_file}")
-                stats['errors'] += 1
-                return stats
+        content = _read_file(input_file)
+        if content is None:
+            print(f"  {c('[-]', 'RED')} Erreur d'encodage : {input_file}")
+            stats['errors'] += 1
+            return stats
 
         if not content.strip():
             print(f"  {c('[!]', 'YELLOW')} Fichier vide : {input_file}")
-            # Copier le fichier vide tel quel
-            output_dir = os.path.dirname(output_file)
-            if output_dir:
-                os.makedirs(output_dir, exist_ok=True)
-            with open(output_file, 'w', encoding='utf-8') as f:
-                f.write(content)
+            _write_file(output_file, content)
             stats['success'] += 1
             return stats
 
@@ -447,13 +388,7 @@ def process_file(input_file, output_file, options, stats=None):
             obfuscated_content = content
             stats['errors'] += 1
 
-        output_dir = os.path.dirname(output_file)
-        if output_dir:
-            os.makedirs(output_dir, exist_ok=True)
-
-        with open(output_file, 'w', encoding='utf-8') as f:
-            f.write(obfuscated_content)
-
+        _write_file(output_file, obfuscated_content)
         print(f"  {c('[+]', 'GREEN')} ✓ {input_file} -> {output_file}")
         stats['success'] += 1
 
@@ -492,19 +427,9 @@ def interactive_menu():
     """Menu interactif style tool Python."""
     print_menu_header()
 
-    # Options par défaut
-    options = {
-        'rename_vars': True,
-        'strip_docstrings': False,
-        'dead_code': False,
-    }
-
-    option_labels = {
-        'rename_vars': 'Renommage de variables (AST)',
-        'strip_docstrings': 'Suppression des commentaires & docstrings',
-        'dead_code': 'Insertion de code mort (Dead Code)',
-    }
-
+    # Options depuis la config centralisée
+    options = {key: default for key, _, default in OBFUSCATION_OPTIONS}
+    option_labels = {key: label for key, label, _ in OBFUSCATION_OPTIONS}
     option_keys = list(options.keys())
 
     while True:
@@ -587,12 +512,8 @@ def _default_output(input_path):
 
 def run_obfuscation(input_path, output_path, options):
     """Exécute l'obfuscation sur le chemin donné."""
-    # Résumé
-    active_opts = [name for key, name in {
-        'rename_vars': 'Renommage variables',
-        'strip_docstrings': 'Suppression docstrings',
-        'dead_code': 'Code mort',
-    }.items() if options.get(key, False)]
+    # Résumé depuis la config centralisée
+    active_opts = [label for key, label, _ in OBFUSCATION_OPTIONS if options.get(key, False)]
 
     print(f"\n{'═' * 60}")
     print(f"  {c('OBFUSCATION EN COURS', 'BOLD')}")
