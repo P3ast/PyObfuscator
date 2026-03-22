@@ -62,6 +62,7 @@ BUILTIN_NAMES = set(dir(builtins)) | {
 # Définition centralisée des options d'obfuscation
 OBFUSCATION_OPTIONS = [
     ('rename_vars',     'Renommage de variables (AST)',                  True),
+    ('rename_funcs',    'Renommage des fonctions & arguments',          False),
     ('strip_docstrings','Suppression des commentaires & docstrings',     False),
     ('dead_code',       'Insertion de code mort (Dead Code)',            False),
 ]
@@ -200,6 +201,115 @@ class SafeVariableRenamer(ast.NodeTransformer):
         node.value = self.visit(node.value)
         return node
 
+#  RENOMMEUR DE FONCTIONS & ARGUMENTS
+
+class FuncArgCollector(ast.NodeVisitor):
+    """Collecte les fonctions (hors classes) et leurs arguments renommables."""
+
+    def __init__(self):
+        self.functions = {}  # {func_name: [arg_names]}
+        self._in_class = False
+
+    def _can_rename(self, name):
+        return (name not in BUILTIN_NAMES
+                and not (name.startswith('__') and name.endswith('__')))
+
+    def _can_rename_arg(self, name):
+        return (name not in BUILTIN_NAMES
+                and name not in ('self', 'cls')
+                and not (name.startswith('__') and name.endswith('__')))
+
+    def visit_ClassDef(self, node):
+        old = self._in_class
+        self._in_class = True
+        self.generic_visit(node)
+        self._in_class = old
+
+    def visit_FunctionDef(self, node):
+        if not self._in_class and self._can_rename(node.name):
+            args = []
+            for arg_list in (node.args.args, node.args.posonlyargs, node.args.kwonlyargs):
+                for a in arg_list:
+                    if self._can_rename_arg(a.arg):
+                        args.append(a.arg)
+            if node.args.vararg and self._can_rename_arg(node.args.vararg.arg):
+                args.append(node.args.vararg.arg)
+            if node.args.kwarg and self._can_rename_arg(node.args.kwarg.arg):
+                args.append(node.args.kwarg.arg)
+            self.functions[node.name] = args
+        self.generic_visit(node)
+
+    visit_AsyncFunctionDef = visit_FunctionDef
+
+
+class FuncArgRenamer(ast.NodeTransformer):
+    """Renomme les noms de fonctions et leurs arguments de manière cohérente."""
+
+    def __init__(self, func_mapping, func_arg_mappings):
+        self.func_mapping = func_mapping          # {orig_name: obf_name}
+        self.func_arg_mappings = func_arg_mappings  # {orig_func: {orig_arg: obf_arg}}
+        self.arg_stack = []   # pile des mappings d'args (scopes imbriqués)
+        self._in_class = False
+
+    def visit_ClassDef(self, node):
+        old = self._in_class
+        self._in_class = True
+        self.generic_visit(node)
+        self._in_class = old
+        return node
+
+    def visit_FunctionDef(self, node):
+        original_name = node.name
+        # Renommer le nom de la fonction
+        if not self._in_class and original_name in self.func_mapping:
+            node.name = self.func_mapping[original_name]
+        # Renommer les arguments
+        arg_mapping = self.func_arg_mappings.get(original_name, {})
+        for arg_list in (node.args.args, node.args.posonlyargs, node.args.kwonlyargs):
+            for a in arg_list:
+                if a.arg in arg_mapping:
+                    a.arg = arg_mapping[a.arg]
+        if node.args.vararg and node.args.vararg.arg in arg_mapping:
+            node.args.vararg.arg = arg_mapping[node.args.vararg.arg]
+        if node.args.kwarg and node.args.kwarg.arg in arg_mapping:
+            node.args.kwarg.arg = arg_mapping[node.args.kwarg.arg]
+        # Empiler le mapping et visiter le corps
+        self.arg_stack.append(arg_mapping)
+        self.generic_visit(node)
+        self.arg_stack.pop()
+        return node
+
+    visit_AsyncFunctionDef = visit_FunctionDef
+
+    def visit_Name(self, node):
+        # D'abord chercher dans les args (scope le plus interne d'abord)
+        for mapping in reversed(self.arg_stack):
+            if node.id in mapping:
+                node.id = mapping[node.id]
+                return node
+        # Ensuite vérifier les noms de fonctions
+        if node.id in self.func_mapping:
+            node.id = self.func_mapping[node.id]
+        return node
+
+    def visit_Call(self, node):
+        # Capturer le nom original avant que generic_visit ne le renomme
+        original_func = None
+        if isinstance(node.func, ast.Name) and node.func.id in self.func_arg_mappings:
+            original_func = node.func.id
+        self.generic_visit(node)
+        # Renommer les arguments nommés (keyword) à l'appel
+        if original_func:
+            am = self.func_arg_mappings[original_func]
+            for kw in node.keywords:
+                if kw.arg and kw.arg in am:
+                    kw.arg = am[kw.arg]
+        return node
+
+    def visit_Attribute(self, node):
+        node.value = self.visit(node.value)
+        return node
+
 #  SUPPRESSEUR DE DOCSTRINGS
 
 class DocstringRemover(ast.NodeTransformer):
@@ -308,11 +418,42 @@ def apply_variable_renaming(source_code):
         return source_code
 
 
+def apply_func_arg_renaming(source_code):
+    """Renomme les fonctions (hors classes) et leurs arguments."""
+    try:
+        tree = ast.parse(source_code)
+        collector = FuncArgCollector()
+        collector.visit(tree)
+
+        # Construire les mappings avec un compteur unique
+        counter = 0
+        func_mapping = {}
+        func_arg_mappings = {}
+        for fname, args in collector.functions.items():
+            func_mapping[fname] = f"_0x{counter:X}_"
+            counter += 1
+            am = {}
+            for aname in args:
+                am[aname] = f"_0x{counter:X}_"
+                counter += 1
+            func_arg_mappings[fname] = am
+
+        tree_copy = copy.deepcopy(tree)
+        renamer = FuncArgRenamer(func_mapping, func_arg_mappings)
+        tree_copy = renamer.visit(tree_copy)
+        ast.fix_missing_locations(tree_copy)
+        return ast.unparse(tree_copy)
+    except Exception as e:
+        print(f"  {c('[-]', 'RED')} Erreur renommage fonctions/arguments : {e}")
+        return source_code
+
+
 def obfuscate_content(content, options):
     """Applique les transformations d'obfuscation selon les options."""
     # Pipeline : chaque étape prend le résultat de la précédente
     pipeline = [
         ('rename_vars',     'Renommage des variables',     lambda src: apply_variable_renaming(src)),
+        ('rename_funcs',    'Renommage fonctions/args',    lambda src: apply_func_arg_renaming(src)),
         ('strip_docstrings','Suppression des docstrings',   lambda src: _apply_transform(src, DocstringRemover(), 'suppression docstrings')),
         ('dead_code',       'Insertion de code mort',       lambda src: _apply_transform(src, DeadCodeInserter(), 'insertion code mort')),
     ]
@@ -576,6 +717,8 @@ def main():
                         help="Supprimer les commentaires et docstrings.")
     parser.add_argument('--dead-code', action='store_true',
                         help="Insérer du code mort pour compliquer la lecture.")
+    parser.add_argument('--rename-funcs', action='store_true',
+                        help="Renommer les noms de fonctions et leurs arguments.")
     parser.add_argument('--all', action='store_true',
                         help="Activer toutes les options d'obfuscation.")
 
@@ -590,6 +733,7 @@ def main():
 
     options = {
         'rename_vars': args.rename_vars or args.all,
+        'rename_funcs': args.rename_funcs or args.all,
         'strip_docstrings': args.strip_docstrings or args.all,
         'dead_code': args.dead_code or args.all,
     }
