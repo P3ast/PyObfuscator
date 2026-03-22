@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 PyObfuscator - Obfuscateur de code Python avancé
-Supporte le renommage de variables, la suppression de docstrings,
+Supporte le renommage de variables/fonctions, la suppression de docstrings,
 l'insertion de code mort, et un menu interactif.
 """
 
@@ -13,7 +13,6 @@ import copy
 import os
 import sys
 import random
-
 
 BANNER = r"""
 ╔══════════════════════════════════════════════════════════════╗
@@ -31,17 +30,24 @@ BANNER = r"""
 """
 
 COLORS = {
-    'RESET':   '\033[0m',
-    'RED':     '\033[91m',
-    'GREEN':   '\033[92m',
-    'YELLOW':  '\033[93m',
-    'BLUE':    '\033[94m',
-    'MAGENTA': '\033[95m',
-    'CYAN':    '\033[96m',
-    'WHITE':   '\033[97m',
-    'BOLD':    '\033[1m',
-    'DIM':     '\033[2m',
+    'RESET': '\033[0m',  'RED':    '\033[91m', 'GREEN':  '\033[92m',
+    'YELLOW': '\033[93m', 'BLUE':   '\033[94m', 'MAGENTA': '\033[95m',
+    'CYAN':  '\033[96m', 'WHITE':  '\033[97m', 'BOLD':   '\033[1m',
+    'DIM':   '\033[2m',
 }
+
+BUILTIN_NAMES = set(dir(builtins)) | {
+    'self', 'cls', '__all__', '__slots__',
+    'None', 'True', 'False', 'NotImplemented', 'Ellipsis',
+}
+
+# (clé, label menu, défaut, flag CLI)
+OBFUSCATION_OPTIONS = [
+    ('rename_vars',      'Renommage de variables (AST)',             True,  '--rename-vars'),
+    ('rename_funcs',     'Renommage des fonctions & arguments',      False, '--rename-funcs'),
+    ('strip_docstrings', 'Suppression des commentaires & docstrings', False, '--strip-docstrings'),
+    ('dead_code',        'Insertion de code mort (Dead Code)',        False, '--dead-code'),
+]
 
 
 def c(text, color):
@@ -49,87 +55,33 @@ def c(text, color):
     return f"{COLORS.get(color, '')}{text}{COLORS['RESET']}"
 
 
-#  NOMS PROTÉGÉS (auto-générés depuis le module builtins + noms spéciaux)
+def _is_dunder(name):
+    return name.startswith('__') and name.endswith('__')
 
-BUILTIN_NAMES = set(dir(builtins)) | {
-    'self', 'cls', '__all__', '__slots__',
-    'None', 'True', 'False', 'NotImplemented', 'Ellipsis',
-}
 
-# Noms qui commencent par __ (dunder) sont toujours protégés
-# Les noms importés sont collectés dynamiquement
+def _collect_all_args(args_node):
+    """Retourne tous les noms d'arguments d'un noeud arguments."""
+    names = [a.arg for lst in (args_node.args, args_node.posonlyargs,
+                               args_node.kwonlyargs) for a in lst]
+    if args_node.vararg:
+        names.append(args_node.vararg.arg)
+    if args_node.kwarg:
+        names.append(args_node.kwarg.arg)
+    return names
 
-# Définition centralisée des options d'obfuscation
-OBFUSCATION_OPTIONS = [
-    ('rename_vars',     'Renommage de variables (AST)',                  True),
-    ('rename_funcs',    'Renommage des fonctions & arguments',          False),
-    ('strip_docstrings','Suppression des commentaires & docstrings',     False),
-    ('dead_code',       'Insertion de code mort (Dead Code)',            False),
-]
 
-#  COLLECTEUR DE NOMS PROTÉGÉS (phase 1 : analyse)
+# ── COLLECTEUR UNIFIÉ (phase 1 : analyse) ──
 
-class ProtectedNameCollector(ast.NodeVisitor):
-    """Parcourt l'AST pour collecter tous les noms qui ne doivent PAS
-    être renommés : imports, noms de fonctions/classes, décorateurs,
-    arguments de fonctions, noms globaux/nonlocal."""
+class ASTCollector(ast.NodeVisitor):
+    """Parcourt l'AST une seule fois pour collecter :
+    - protected : noms à ne jamais renommer (imports, classes, décorateurs…)
+    - functions : {nom_func: [arg_names]} pour les fonctions hors classe
+    """
 
     def __init__(self):
         self.protected = set()
-
-    def visit_Import(self, node):
-        for alias in node.names:
-            name = alias.asname if alias.asname else alias.name
-            # Pour "import os.path", on protège "os"
-            self.protected.add(name.split('.')[0])
-        self.generic_visit(node)
-
-    def visit_ImportFrom(self, node):
-        for alias in node.names:
-            name = alias.asname if alias.asname else alias.name
-            self.protected.add(name)
-        self.generic_visit(node)
-
-    def visit_FunctionDef(self, node):
-        self.protected.add(node.name)
-        # Protéger tous les arguments
-        for arg in node.args.args:
-            self.protected.add(arg.arg)
-        for arg in node.args.posonlyargs:
-            self.protected.add(arg.arg)
-        for arg in node.args.kwonlyargs:
-            self.protected.add(arg.arg)
-        if node.args.vararg:
-            self.protected.add(node.args.vararg.arg)
-        if node.args.kwarg:
-            self.protected.add(node.args.kwarg.arg)
-        # Protéger les décorateurs
-        for decorator in node.decorator_list:
-            self._collect_decorator_names(decorator)
-        self.generic_visit(node)
-
-    visit_AsyncFunctionDef = visit_FunctionDef
-
-    def visit_ClassDef(self, node):
-        self.protected.add(node.name)
-        for decorator in node.decorator_list:
-            self._collect_decorator_names(decorator)
-        self.generic_visit(node)
-
-    def visit_Global(self, node):
-        for name in node.names:
-            self.protected.add(name)
-        self.generic_visit(node)
-
-    def visit_Nonlocal(self, node):
-        for name in node.names:
-            self.protected.add(name)
-        self.generic_visit(node)
-
-    def visit_ExceptHandler(self, node):
-        if node.name:
-            self.protected.add(node.name)
-        self.generic_visit(node)
+        self.functions = {}
+        self._in_class = False
 
     def _collect_decorator_names(self, node):
         if isinstance(node, ast.Name):
@@ -139,116 +91,101 @@ class ProtectedNameCollector(ast.NodeVisitor):
         elif isinstance(node, ast.Call):
             self._collect_decorator_names(node.func)
 
-#  RENOMMEUR DE VARIABLES (phase 2 : transformation)
+    def visit_Import(self, node):
+        for alias in node.names:
+            self.protected.add((alias.asname or alias.name).split('.')[0])
+        self.generic_visit(node)
+
+    def visit_ImportFrom(self, node):
+        for alias in node.names:
+            self.protected.add(alias.asname or alias.name)
+        self.generic_visit(node)
+
+    def visit_FunctionDef(self, node):
+        self.protected.add(node.name)
+        all_args = _collect_all_args(node.args)
+        for a in all_args:
+            self.protected.add(a)
+        for deco in node.decorator_list:
+            self._collect_decorator_names(deco)
+        # Collecter en tant que fonction renommable (hors classe)
+        if not self._in_class and node.name not in BUILTIN_NAMES and not _is_dunder(node.name):
+            renamable = [a for a in all_args
+                         if a not in BUILTIN_NAMES and a not in ('self', 'cls') and not _is_dunder(a)]
+            self.functions[node.name] = renamable
+        self.generic_visit(node)
+
+    visit_AsyncFunctionDef = visit_FunctionDef
+
+    def visit_ClassDef(self, node):
+        self.protected.add(node.name)
+        for deco in node.decorator_list:
+            self._collect_decorator_names(deco)
+        old = self._in_class
+        self._in_class = True
+        self.generic_visit(node)
+        self._in_class = old
+
+    def visit_Global(self, node):
+        self.protected.update(node.names)
+        self.generic_visit(node)
+
+    def visit_Nonlocal(self, node):
+        self.protected.update(node.names)
+        self.generic_visit(node)
+
+    def visit_ExceptHandler(self, node):
+        if node.name:
+            self.protected.add(node.name)
+        self.generic_visit(node)
+
+
+# ── RENOMMEUR DE VARIABLES ──
 
 class SafeVariableRenamer(ast.NodeTransformer):
-    """Renomme UNIQUEMENT les variables locales/simples en évitant de
-    casser les imports, fonctions, classes, arguments, attributs, etc."""
+    """Renomme uniquement les variables locales/simples."""
 
     def __init__(self, protected_names):
         self.protected = protected_names | BUILTIN_NAMES
         self.mapping = {}
         self.counter = 0
 
-    def _get_obfuscated_name(self, original):
-        if original not in self.mapping:
-            self.mapping[original] = f"_O0O{self.counter:X}O0_"
+    def _obf(self, name):
+        if name not in self.mapping:
+            self.mapping[name] = f"_O0O{self.counter:X}O0_"
             self.counter += 1
-        return self.mapping[original]
+        return self.mapping[name]
 
     def visit_Name(self, node):
         self.generic_visit(node)
-        name = node.id
-
-        # Ne pas toucher aux noms protégés
-        if name in self.protected:
+        n = node.id
+        if n in self.protected or _is_dunder(n):
             return node
-
-        # Ne pas toucher aux noms dunder
-        if name.startswith('__') and name.endswith('__'):
+        if n.startswith('_') and len(n) > 1 and n[1].isupper():
             return node
-
-        # Ne pas toucher aux noms commençant par _ suivi de majuscule (convention privée de classe)
-        if name.startswith('_') and len(name) > 1 and name[1].isupper():
-            return node
-
-        node.id = self._get_obfuscated_name(name)
-        return node
-
-    # Ne PAS transformer les arguments de fonctions
-    def visit_FunctionDef(self, node):
-        # On ne renomme pas le nom de la fonction
-        # Mais on visite le corps
-        self.generic_visit(node)
-        return node
-
-    visit_AsyncFunctionDef = visit_FunctionDef
-
-    def visit_ClassDef(self, node):
-        self.generic_visit(node)
+        node.id = self._obf(n)
         return node
 
     def visit_Import(self, node):
-        # Ne pas toucher aux imports
         return node
 
     def visit_ImportFrom(self, node):
-        # Ne pas toucher aux imports
         return node
 
     def visit_Attribute(self, node):
-        # Visiter la partie valeur (.value) mais ne PAS renommer l'attribut (.attr)
         node.value = self.visit(node.value)
         return node
 
-#  RENOMMEUR DE FONCTIONS & ARGUMENTS
 
-class FuncArgCollector(ast.NodeVisitor):
-    """Collecte les fonctions (hors classes) et leurs arguments renommables."""
-
-    def __init__(self):
-        self.functions = {}  # {func_name: [arg_names]}
-        self._in_class = False
-
-    def _can_rename(self, name):
-        return (name not in BUILTIN_NAMES
-                and not (name.startswith('__') and name.endswith('__')))
-
-    def _can_rename_arg(self, name):
-        return (name not in BUILTIN_NAMES
-                and name not in ('self', 'cls')
-                and not (name.startswith('__') and name.endswith('__')))
-
-    def visit_ClassDef(self, node):
-        old = self._in_class
-        self._in_class = True
-        self.generic_visit(node)
-        self._in_class = old
-
-    def visit_FunctionDef(self, node):
-        if not self._in_class and self._can_rename(node.name):
-            args = []
-            for arg_list in (node.args.args, node.args.posonlyargs, node.args.kwonlyargs):
-                for a in arg_list:
-                    if self._can_rename_arg(a.arg):
-                        args.append(a.arg)
-            if node.args.vararg and self._can_rename_arg(node.args.vararg.arg):
-                args.append(node.args.vararg.arg)
-            if node.args.kwarg and self._can_rename_arg(node.args.kwarg.arg):
-                args.append(node.args.kwarg.arg)
-            self.functions[node.name] = args
-        self.generic_visit(node)
-
-    visit_AsyncFunctionDef = visit_FunctionDef
-
+# ── RENOMMEUR DE FONCTIONS & ARGUMENTS ──
 
 class FuncArgRenamer(ast.NodeTransformer):
     """Renomme les noms de fonctions et leurs arguments de manière cohérente."""
 
     def __init__(self, func_mapping, func_arg_mappings):
-        self.func_mapping = func_mapping          # {orig_name: obf_name}
-        self.func_arg_mappings = func_arg_mappings  # {orig_func: {orig_arg: obf_arg}}
-        self.arg_stack = []   # pile des mappings d'args (scopes imbriqués)
+        self.func_mapping = func_mapping
+        self.func_arg_mappings = func_arg_mappings
+        self.arg_stack = []
         self._in_class = False
 
     def visit_ClassDef(self, node):
@@ -259,22 +196,20 @@ class FuncArgRenamer(ast.NodeTransformer):
         return node
 
     def visit_FunctionDef(self, node):
-        original_name = node.name
-        # Renommer le nom de la fonction
-        if not self._in_class and original_name in self.func_mapping:
-            node.name = self.func_mapping[original_name]
-        # Renommer les arguments
-        arg_mapping = self.func_arg_mappings.get(original_name, {})
+        orig = node.name
+        if not self._in_class and orig in self.func_mapping:
+            node.name = self.func_mapping[orig]
+        am = self.func_arg_mappings.get(orig, {})
+        # Renommer les arguments dans la signature
         for arg_list in (node.args.args, node.args.posonlyargs, node.args.kwonlyargs):
             for a in arg_list:
-                if a.arg in arg_mapping:
-                    a.arg = arg_mapping[a.arg]
-        if node.args.vararg and node.args.vararg.arg in arg_mapping:
-            node.args.vararg.arg = arg_mapping[node.args.vararg.arg]
-        if node.args.kwarg and node.args.kwarg.arg in arg_mapping:
-            node.args.kwarg.arg = arg_mapping[node.args.kwarg.arg]
-        # Empiler le mapping et visiter le corps
-        self.arg_stack.append(arg_mapping)
+                if a.arg in am:
+                    a.arg = am[a.arg]
+        if node.args.vararg and node.args.vararg.arg in am:
+            node.args.vararg.arg = am[node.args.vararg.arg]
+        if node.args.kwarg and node.args.kwarg.arg in am:
+            node.args.kwarg.arg = am[node.args.kwarg.arg]
+        self.arg_stack.append(am)
         self.generic_visit(node)
         self.arg_stack.pop()
         return node
@@ -282,25 +217,21 @@ class FuncArgRenamer(ast.NodeTransformer):
     visit_AsyncFunctionDef = visit_FunctionDef
 
     def visit_Name(self, node):
-        # D'abord chercher dans les args (scope le plus interne d'abord)
         for mapping in reversed(self.arg_stack):
             if node.id in mapping:
                 node.id = mapping[node.id]
                 return node
-        # Ensuite vérifier les noms de fonctions
         if node.id in self.func_mapping:
             node.id = self.func_mapping[node.id]
         return node
 
     def visit_Call(self, node):
-        # Capturer le nom original avant que generic_visit ne le renomme
-        original_func = None
+        orig_func = None
         if isinstance(node.func, ast.Name) and node.func.id in self.func_arg_mappings:
-            original_func = node.func.id
+            orig_func = node.func.id
         self.generic_visit(node)
-        # Renommer les arguments nommés (keyword) à l'appel
-        if original_func:
-            am = self.func_arg_mappings[original_func]
+        if orig_func:
+            am = self.func_arg_mappings[orig_func]
             for kw in node.keywords:
                 if kw.arg and kw.arg in am:
                     kw.arg = am[kw.arg]
@@ -310,89 +241,60 @@ class FuncArgRenamer(ast.NodeTransformer):
         node.value = self.visit(node.value)
         return node
 
-#  SUPPRESSEUR DE DOCSTRINGS
+
+# ── SUPPRESSEUR DE DOCSTRINGS ──
 
 class DocstringRemover(ast.NodeTransformer):
     """Supprime les docstrings des modules, classes et fonctions."""
 
-    def _remove_docstring(self, node):
-        if (node.body and
-                isinstance(node.body[0], ast.Expr) and
-                isinstance(node.body[0].value, ast.Constant) and
-                isinstance(node.body[0].value.value, str)):
-            node.body = node.body[1:]
-            # Si le corps est vide après suppression, ajouter pass
-            if not node.body:
-                node.body = [ast.Pass()]
+    def _strip(self, node):
+        self.generic_visit(node)
+        if (node.body and isinstance(node.body[0], ast.Expr)
+                and isinstance(node.body[0].value, ast.Constant)
+                and isinstance(node.body[0].value.value, str)):
+            node.body = node.body[1:] or [ast.Pass()]
         return node
 
-    def visit_Module(self, node):
-        self.generic_visit(node)
-        return self._remove_docstring(node)
+    visit_Module = visit_FunctionDef = visit_AsyncFunctionDef = visit_ClassDef = _strip
 
-    def visit_FunctionDef(self, node):
-        self.generic_visit(node)
-        return self._remove_docstring(node)
 
-    visit_AsyncFunctionDef = visit_FunctionDef
-
-    def visit_ClassDef(self, node):
-        self.generic_visit(node)
-        return self._remove_docstring(node)
-
-#  INSERTION DE CODE MORT (Dead Code Insertion)
+# ── INSERTION DE CODE MORT ──
 
 class DeadCodeInserter(ast.NodeTransformer):
-    """Insère du code mort (jamais exécuté) pour rendre la lecture
-    plus difficile. Utilise des conditions toujours fausses."""
+    """Insère des blocs de code mort (jamais exécutés) dans les fonctions."""
 
     def __init__(self):
         self.counter = 0
 
-    def _make_dead_var_name(self):
+    def _dead_block(self):
         self.counter += 1
-        return f"_x{self.counter:X}z_"
-
-    def _make_dead_block(self):
-        """Crée un bloc de code mort dans un if toujours faux."""
-        dead_var = self._make_dead_var_name()
-        # Condition toujours fausse : if 0 > 1:
-        false_test = ast.Compare(
-            left=ast.Constant(value=0),
-            ops=[ast.Gt()],
-            comparators=[ast.Constant(value=1)]
-        )
-        # Corps du bloc mort : assignation inutile
-        dead_body = [
-            ast.Assign(
-                targets=[ast.Name(id=dead_var, ctx=ast.Store())],
-                value=ast.BinOp(
-                    left=ast.Constant(value=random.randint(100, 9999)),
-                    op=ast.Add(),
-                    right=ast.Constant(value=random.randint(100, 9999))
-                ),
-                lineno=0
-            )
-        ]
-        return ast.If(test=false_test, body=dead_body, orelse=[])
+        return ast.If(
+            test=ast.Compare(left=ast.Constant(0), ops=[ast.Gt()],
+                             comparators=[ast.Constant(1)]),
+            body=[ast.Assign(
+                targets=[ast.Name(id=f"_x{self.counter:X}z_", ctx=ast.Store())],
+                value=ast.BinOp(left=ast.Constant(random.randint(100, 9999)),
+                                op=ast.Add(),
+                                right=ast.Constant(random.randint(100, 9999))),
+                lineno=0)],
+            orelse=[])
 
     def visit_FunctionDef(self, node):
         self.generic_visit(node)
         if len(node.body) >= 2:
-            # Insérer un bloc mort au début du corps de la fonction
-            dead = self._make_dead_block()
-            node.body.insert(0, dead)
+            node.body.insert(0, self._dead_block())
         return node
 
     visit_AsyncFunctionDef = visit_FunctionDef
 
-#  FONCTIONS D'OBFUSCATION
 
-def _apply_transform(source_code, transformer, label):
-    """Applique un ast.NodeTransformer générique sur le code source."""
+# ── FONCTIONS D'OBFUSCATION ──
+
+def _safe_transform(source_code, transform_fn, label):
+    """Parse → transforme → re-génère le code, avec gestion d'erreur."""
     try:
         tree = ast.parse(source_code)
-        tree = transformer.visit(tree)
+        tree = transform_fn(tree)
         ast.fix_missing_locations(tree)
         return ast.unparse(tree)
     except Exception as e:
@@ -402,77 +304,62 @@ def _apply_transform(source_code, transformer, label):
 
 def apply_variable_renaming(source_code):
     """Renomme les variables locales de manière sûre."""
-    try:
-        tree = ast.parse(source_code)
-        # Phase 1 : collecter les noms protégés
-        collector = ProtectedNameCollector()
+    def transform(tree):
+        collector = ASTCollector()
         collector.visit(tree)
-        # Phase 2 : renommer sur une copie de l'arbre (évite un double parse)
         tree_copy = copy.deepcopy(tree)
-        renamer = SafeVariableRenamer(collector.protected)
-        tree_copy = renamer.visit(tree_copy)
-        ast.fix_missing_locations(tree_copy)
-        return ast.unparse(tree_copy)
-    except Exception as e:
-        print(f"  {c('[-]', 'RED')} Erreur renommage variables : {e}")
-        return source_code
+        return SafeVariableRenamer(collector.protected).visit(tree_copy)
+    return _safe_transform(source_code, transform, 'renommage variables')
 
 
 def apply_func_arg_renaming(source_code):
     """Renomme les fonctions (hors classes) et leurs arguments."""
-    try:
-        tree = ast.parse(source_code)
-        collector = FuncArgCollector()
+    def transform(tree):
+        collector = ASTCollector()
         collector.visit(tree)
-
-        # Construire les mappings avec un compteur unique
         counter = 0
-        func_mapping = {}
-        func_arg_mappings = {}
+        fm, fam = {}, {}
         for fname, args in collector.functions.items():
-            func_mapping[fname] = f"_0x{counter:X}_"
+            fm[fname] = f"_0x{counter:X}_"
             counter += 1
             am = {}
             for aname in args:
                 am[aname] = f"_0x{counter:X}_"
                 counter += 1
-            func_arg_mappings[fname] = am
-
+            fam[fname] = am
         tree_copy = copy.deepcopy(tree)
-        renamer = FuncArgRenamer(func_mapping, func_arg_mappings)
-        tree_copy = renamer.visit(tree_copy)
-        ast.fix_missing_locations(tree_copy)
-        return ast.unparse(tree_copy)
-    except Exception as e:
-        print(f"  {c('[-]', 'RED')} Erreur renommage fonctions/arguments : {e}")
-        return source_code
+        return FuncArgRenamer(fm, fam).visit(tree_copy)
+    return _safe_transform(source_code, transform, 'renommage fonctions/arguments')
+
+
+# Pipeline d'obfuscation
+PIPELINE = [
+    ('rename_vars',      'Renommage des variables',    lambda s: apply_variable_renaming(s)),
+    ('rename_funcs',     'Renommage fonctions/args',   lambda s: apply_func_arg_renaming(s)),
+    ('strip_docstrings', 'Suppression des docstrings',
+     lambda s: _safe_transform(s, lambda t: DocstringRemover().visit(t), 'suppression docstrings')),
+    ('dead_code',        'Insertion de code mort',
+     lambda s: _safe_transform(s, lambda t: DeadCodeInserter().visit(t), 'insertion code mort')),
+]
 
 
 def obfuscate_content(content, options):
     """Applique les transformations d'obfuscation selon les options."""
-    # Pipeline : chaque étape prend le résultat de la précédente
-    pipeline = [
-        ('rename_vars',     'Renommage des variables',     lambda src: apply_variable_renaming(src)),
-        ('rename_funcs',    'Renommage fonctions/args',    lambda src: apply_func_arg_renaming(src)),
-        ('strip_docstrings','Suppression des docstrings',   lambda src: _apply_transform(src, DocstringRemover(), 'suppression docstrings')),
-        ('dead_code',       'Insertion de code mort',       lambda src: _apply_transform(src, DeadCodeInserter(), 'insertion code mort')),
-    ]
-
     result = content
-    for key, label, transform in pipeline:
-        if options.get(key, False):
+    for key, label, transform in PIPELINE:
+        if options.get(key):
             print(f"  {c('[*]', 'CYAN')} {label}...")
             result = transform(result)
-
     return result
 
-#  TRAITEMENT DE FICHIERS
+
+# ── TRAITEMENT DE FICHIERS ──
 
 def _read_file(filepath):
-    """Lit un fichier Python avec fallback d'encodage."""
-    for encoding in ('utf-8', 'latin-1'):
+    """Lit un fichier avec fallback d'encodage."""
+    for enc in ('utf-8', 'latin-1'):
         try:
-            with open(filepath, 'r', encoding=encoding) as f:
+            with open(filepath, 'r', encoding=enc) as f:
                 return f.read()
         except UnicodeDecodeError:
             continue
@@ -480,10 +367,10 @@ def _read_file(filepath):
 
 
 def _write_file(filepath, content):
-    """Écrit du contenu dans un fichier en créant les dossiers parents."""
-    output_dir = os.path.dirname(filepath)
-    if output_dir:
-        os.makedirs(output_dir, exist_ok=True)
+    """Écrit du contenu en créant les dossiers parents si nécessaire."""
+    d = os.path.dirname(filepath)
+    if d:
+        os.makedirs(d, exist_ok=True)
     with open(filepath, 'w', encoding='utf-8') as f:
         f.write(content)
 
@@ -492,10 +379,9 @@ def process_file(input_file, output_file, options, stats=None):
     """Traite un fichier Python unique."""
     if stats is None:
         stats = {'success': 0, 'errors': 0}
-
     try:
         if not input_file.endswith('.py'):
-            print(f"  {c('[!]', 'YELLOW')} Ignoré : {input_file} (pas un fichier .py)")
+            print(f"  {c('[!]', 'YELLOW')} Ignoré : {input_file} (pas un .py)")
             return stats
 
         content = _read_file(input_file)
@@ -505,7 +391,6 @@ def process_file(input_file, output_file, options, stats=None):
             return stats
 
         if not content.strip():
-            print(f"  {c('[!]', 'YELLOW')} Fichier vide : {input_file}")
             _write_file(output_file, content)
             stats['success'] += 1
             return stats
@@ -518,67 +403,54 @@ def process_file(input_file, output_file, options, stats=None):
             return stats
 
         print(f"\n  {c('[>]', 'BLUE')} Traitement : {c(input_file, 'WHITE')}")
-        obfuscated_content = obfuscate_content(content, options)
+        result = obfuscate_content(content, options)
 
-        # Vérifier que le code obfusqué est valide
         try:
-            ast.parse(obfuscated_content)
-        except SyntaxError as e:
-            print(f"  {c('[-]', 'RED')} Code obfusqué invalide pour {input_file} : {e}")
-            print(f"  {c('[!]', 'YELLOW')} Le fichier original sera copié tel quel.")
-            obfuscated_content = content
+            ast.parse(result)
+        except SyntaxError:
+            print(f"  {c('[-]', 'RED')} Code obfusqué invalide, copie du fichier original.")
+            result = content
             stats['errors'] += 1
 
-        _write_file(output_file, obfuscated_content)
+        _write_file(output_file, result)
         print(f"  {c('[+]', 'GREEN')} ✓ {input_file} -> {output_file}")
         stats['success'] += 1
 
     except Exception as e:
-        print(f"  {c('[-]', 'RED')} Erreur de traitement sur {input_file} : {e}")
+        print(f"  {c('[-]', 'RED')} Erreur sur {input_file} : {e}")
         stats['errors'] += 1
-
     return stats
 
 
 def process_directory(input_dir, output_dir, options):
     """Traite tous les fichiers .py d'un dossier récursivement."""
-    stats = {'success': 0, 'errors': 0}
-    count = 0
-
+    stats, count = {'success': 0, 'errors': 0}, 0
     for root, _, files in os.walk(input_dir):
-        for file in files:
-            if file.endswith('.py'):
+        for f in files:
+            if f.endswith('.py'):
                 count += 1
-                input_path = os.path.join(root, file)
-                relative_path = os.path.relpath(input_path, input_dir)
-                output_path = os.path.join(output_dir, relative_path)
-                stats = process_file(input_path, output_path, options, stats)
-
+                inp = os.path.join(root, f)
+                out = os.path.join(output_dir, os.path.relpath(inp, input_dir))
+                stats = process_file(inp, out, options, stats)
     return count, stats
 
-#  MENU INTERACTIF
 
-def print_menu_header():
-    """Affiche le banner et l'en-tête du menu."""
-    os.system('cls' if os.name == 'nt' else 'clear')
-    print(c(BANNER, 'CYAN'))
-
+# ── MENU INTERACTIF ──
 
 def interactive_menu():
     """Menu interactif style tool Python."""
-    print_menu_header()
+    os.system('cls' if os.name == 'nt' else 'clear')
+    print(c(BANNER, 'CYAN'))
 
-    # Options depuis la config centralisée
-    options = {key: default for key, _, default in OBFUSCATION_OPTIONS}
-    option_labels = {key: label for key, label, _ in OBFUSCATION_OPTIONS}
-    option_keys = list(options.keys())
+    options = {key: default for key, _, default, _ in OBFUSCATION_OPTIONS}
+    labels = {key: label for key, label, _, _ in OBFUSCATION_OPTIONS}
+    keys = list(options.keys())
 
     while True:
         print(f"\n  {c('═══ OPTIONS D\'OBFUSCATION ═══', 'MAGENTA')}\n")
-
-        for i, key in enumerate(option_keys, 1):
-            status = c('ON ', 'GREEN') if options[key] else c('OFF', 'RED')
-            print(f"    [{c(str(i), 'CYAN')}] [{status}] {option_labels[key]}")
+        for i, key in enumerate(keys, 1):
+            st = c('ON ', 'GREEN') if options[key] else c('OFF', 'RED')
+            print(f"    [{c(str(i), 'CYAN')}] [{st}] {labels[key]}")
 
         print(f"\n    [{c('S', 'YELLOW')}] Sélectionner tout")
         print(f"    [{c('D', 'YELLOW')}] Désélectionner tout")
@@ -591,159 +463,105 @@ def interactive_menu():
             print(f"\n  {c('[*]', 'YELLOW')} Au revoir !\n")
             sys.exit(0)
         elif choice == 'C':
-            # Au moins une option doit être activée
             if not any(options.values()):
-                print(f"\n  {c('[!]', 'YELLOW')} Aucune option activée ! Activez au moins une option.")
+                print(f"\n  {c('[!]', 'YELLOW')} Activez au moins une option.")
                 continue
             break
         elif choice == 'S':
-            for key in option_keys:
-                options[key] = True
+            options = {k: True for k in keys}
         elif choice == 'D':
-            for key in option_keys:
-                options[key] = False
-        elif choice.isdigit():
-            idx = int(choice) - 1
-            if 0 <= idx < len(option_keys):
-                key = option_keys[idx]
-                options[key] = not options[key]
-            else:
-                print(f"  {c('[!]', 'YELLOW')} Option invalide.")
+            options = {k: False for k in keys}
+        elif choice.isdigit() and 0 <= int(choice) - 1 < len(keys):
+            k = keys[int(choice) - 1]
+            options[k] = not options[k]
         else:
             print(f"  {c('[!]', 'YELLOW')} Choix invalide.")
 
-    # Demander le chemin d'entrée
+    # Chemin d'entrée
     print(f"\n  {c('═══ FICHIERS ═══', 'MAGENTA')}\n")
-
     while True:
-        input_path = input(f"  {c('>', 'CYAN')} Fichier ou dossier source : ").strip()
+        input_path = input(f"  {c('>', 'CYAN')} Fichier ou dossier source : ").strip().strip('"').strip("'")
         if not input_path:
             print(f"  {c('[!]', 'YELLOW')} Veuillez entrer un chemin.")
-            continue
-        # Supprimer les guillemets autour du chemin (drag & drop)
-        input_path = input_path.strip('"').strip("'")
-        if not os.path.exists(input_path):
+        elif not os.path.exists(input_path):
             print(f"  {c('[-]', 'RED')} Le chemin '{input_path}' n'existe pas.")
-            continue
-        break
+        else:
+            break
 
     # Chemin de sortie
-    while True:
-        default_output = _default_output(input_path)
-        output_path = input(
-            f"  {c('>', 'CYAN')} Dossier/fichier de sortie [{c(default_output, 'DIM')}] : "
-        ).strip()
-        if not output_path:
-            output_path = default_output
-        output_path = output_path.strip('"').strip("'")
-        break
+    default_out = _default_output(input_path)
+    output_path = input(
+        f"  {c('>', 'CYAN')} Sortie [{c(default_out, 'DIM')}] : "
+    ).strip().strip('"').strip("'") or default_out
 
     return input_path, output_path, options
 
 
-def _default_output(input_path):
-    """Génère un chemin de sortie par défaut."""
-    if os.path.isfile(input_path):
-        base, ext = os.path.splitext(input_path)
+def _default_output(path):
+    if os.path.isfile(path):
+        base, ext = os.path.splitext(path)
         return f"{base}_obfuscated{ext}"
-    else:
-        return os.path.join(os.path.dirname(input_path), os.path.basename(input_path) + "_obfuscated")
+    return path + "_obfuscated"
 
-#  POINT D'ENTRÉE
+
+# ── POINT D'ENTRÉE ──
 
 def run_obfuscation(input_path, output_path, options):
     """Exécute l'obfuscation sur le chemin donné."""
-    # Résumé depuis la config centralisée
-    active_opts = [label for key, label, _ in OBFUSCATION_OPTIONS if options.get(key, False)]
+    active = [label for key, label, _, _ in OBFUSCATION_OPTIONS if options.get(key)]
 
-    print(f"\n{'═' * 60}")
-    print(f"  {c('OBFUSCATION EN COURS', 'BOLD')}")
-    print(f"{'═' * 60}")
+    sep = '═' * 60
+    print(f"\n{sep}\n  {c('OBFUSCATION EN COURS', 'BOLD')}\n{sep}")
     print(f"  Entrée  : {c(input_path, 'WHITE')}")
     print(f"  Sortie  : {c(output_path, 'WHITE')}")
-    print(f"  Options : {c(', '.join(active_opts), 'CYAN')}")
-    print(f"{'═' * 60}")
+    print(f"  Options : {c(', '.join(active), 'CYAN')}\n{sep}")
 
     if os.path.isfile(input_path):
-        if os.path.isdir(output_path):
-            output_file = os.path.join(output_path, os.path.basename(input_path))
-        else:
-            output_file = output_path
-
-        stats = process_file(input_path, output_file, options)
-        print(f"\n  {c('Résumé', 'BOLD')} : {stats['success']} fichier(s) traité(s), "
-              f"{stats['errors']} erreur(s)")
-
+        out = os.path.join(output_path, os.path.basename(input_path)) if os.path.isdir(output_path) else output_path
+        stats = process_file(input_path, out, options)
+        print(f"\n  {c('Résumé', 'BOLD')} : {stats['success']} fichier(s), {stats['errors']} erreur(s)")
     elif os.path.isdir(input_path):
         count, stats = process_directory(input_path, output_path, options)
-        print(f"\n  {c('Résumé', 'BOLD')} : {stats['success']}/{count} fichier(s) traité(s), "
-              f"{stats['errors']} erreur(s)")
+        print(f"\n  {c('Résumé', 'BOLD')} : {stats['success']}/{count} fichier(s), {stats['errors']} erreur(s)")
 
-    print(f"\n{'═' * 60}")
-    print(f"  {c('✓ Obfuscation terminée !', 'GREEN')}")
-    print(f"{'═' * 60}\n")
+    print(f"\n{sep}\n  {c('✓ Obfuscation terminée !', 'GREEN')}\n{sep}\n")
 
 
 def main():
     """Point d'entrée principal : mode CLI ou interactif."""
-
-    # Si aucun argument => mode interactif
     if len(sys.argv) == 1:
-        input_path, output_path, options = interactive_menu()
-        run_obfuscation(input_path, output_path, options)
+        inp, out, opts = interactive_menu()
+        run_obfuscation(inp, out, opts)
         return
 
-    # Mode CLI (argparse)
     parser = argparse.ArgumentParser(
         description="PyObfuscator - Obfuscateur de code Python avancé.",
-        epilog="Exemples d'utilisation :\n"
-               "  python main.py -i source.py -o output.py\n"
-               "  python main.py -i source.py -o output.py --rename-vars\n"
-               "  python main.py -i src/ -o dist/ --rename-vars --strip-docstrings --dead-code\n"
-               "\n"
-               "  Mode interactif (sans arguments) :\n"
-               "  python main.py",
-        formatter_class=argparse.RawDescriptionHelpFormatter
-    )
+        epilog="Exemples :\n"
+               "  python main.py -i source.py -o output.py --all\n"
+               "  python main.py -i src/ -o dist/ --rename-vars --rename-funcs\n"
+               "\n  Mode interactif : python main.py",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
 
-    parser.add_argument('-i', '--input', required=True,
-                        help="Chemin vers le fichier ou dossier source.")
-    parser.add_argument('-o', '--output', required=True,
-                        help="Chemin vers le fichier ou dossier de destination.")
-
-    parser.add_argument('--rename-vars', action='store_true',
-                        help="Renommer les variables avec des noms obfusqués (recommandé).")
-    parser.add_argument('--strip-docstrings', action='store_true',
-                        help="Supprimer les commentaires et docstrings.")
-    parser.add_argument('--dead-code', action='store_true',
-                        help="Insérer du code mort pour compliquer la lecture.")
-    parser.add_argument('--rename-funcs', action='store_true',
-                        help="Renommer les noms de fonctions et leurs arguments.")
-    parser.add_argument('--all', action='store_true',
-                        help="Activer toutes les options d'obfuscation.")
+    parser.add_argument('-i', '--input', required=True, help="Fichier ou dossier source.")
+    parser.add_argument('-o', '--output', required=True, help="Fichier ou dossier de destination.")
+    for key, label, _, flag in OBFUSCATION_OPTIONS:
+        parser.add_argument(flag, action='store_true', help=label)
+    parser.add_argument('--all', action='store_true', help="Activer toutes les options.")
 
     args = parser.parse_args()
 
-    input_path = args.input
-    output_path = args.output
-
-    if not os.path.exists(input_path):
-        print(f"  {c('[-]', 'RED')} Erreur : '{input_path}' n'existe pas.")
+    if not os.path.exists(args.input):
+        print(f"  {c('[-]', 'RED')} Erreur : '{args.input}' n'existe pas.")
         sys.exit(1)
 
-    options = {
-        'rename_vars': args.rename_vars or args.all,
-        'rename_funcs': args.rename_funcs or args.all,
-        'strip_docstrings': args.strip_docstrings or args.all,
-        'dead_code': args.dead_code or args.all,
-    }
-
-    # Si aucune option spécifiée en CLI, activer au moins le renommage
+    # Construire les options depuis la config centralisée
+    options = {key: getattr(args, key.replace('-', '_')) or args.all
+               for key, _, _, _ in OBFUSCATION_OPTIONS}
     if not any(options.values()):
         options['rename_vars'] = True
 
     print(c(BANNER, 'CYAN'))
-    run_obfuscation(input_path, output_path, options)
+    run_obfuscation(args.input, args.output, options)
 
 
 if __name__ == "__main__":
