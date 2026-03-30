@@ -25,6 +25,7 @@ L'outil propose 4 transformations, activables individuellement :
 - **Renommage de fonctions & arguments** — Les noms de fonctions et leurs paramètres deviennent `_0x0_`, `_0x1_`, etc. Les méthodes de classe sont exclues pour éviter de casser les appels `self.method()`.
 - **Suppression des docstrings** — Retire les docstrings des modules, classes et fonctions.
 - **Insertion de code mort** — Ajoute des blocs `if 0 > 1:` contenant des opérations inutiles dans le corps des fonctions, afin de compliquer la lecture.
+- **Aplatissement du flux** (Control Flow Flattening) — Détruit la structure d'exécution linéaire des fonctions en plaçant les instructions dans une grande boucle while contrôlée par un routeur if/elif et une variable d'état générée aléatoirement.
 
 ## Installation
 
@@ -56,8 +57,8 @@ python main.py -i source.py -o output.py --all
 # Renommage des variables uniquement
 python main.py -i source.py -o output.py --rename-vars
 
-# Variables + fonctions/arguments
-python main.py -i source.py -o output.py --rename-vars --rename-funcs
+# Variables + fonctions/arguments + flattening
+python main.py -i source.py -o output.py --rename-vars --rename-funcs --flatten
 
 # Obfusquer un dossier entier (récursif)
 python main.py -i mon_projet/ -o mon_projet_obf/ --all
@@ -73,6 +74,7 @@ python main.py -i mon_projet/ -o mon_projet_obf/ --all
 | `--rename-funcs` | Renommage des fonctions & arguments |
 | `--strip-docstrings` | Suppression des docstrings |
 | `--dead-code` | Insertion de code mort |
+| `--flatten` | Aplatissement du flux (Control Flow Flattening) |
 | `--all` | Active toutes les options |
 
 ## Exemple
